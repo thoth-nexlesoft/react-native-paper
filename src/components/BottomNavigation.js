@@ -169,6 +169,11 @@ type State = {
    */
   shifts: Animated.Value[],
   /**
+   * The top offset for each tab item to position it offscreen.
+   * Placing items offscreen helps to save memory usage for inactive screens with removeClippedSubviews
+   */
+  offsets: Animated.Value[],
+  /**
    * Index of the currently active tab. Used for setting the background color.
    * Use don't use the color as an animated value directly, because `setValue` seems to be buggy with colors.
    */
@@ -207,6 +212,34 @@ const BAR_HEIGHT = 56;
 const SMALL_RIPPLE_SIZE = 96;
 const ACTIVE_LABEL_SIZE = 14;
 const INACTIVE_LABEL_SIZE = 12;
+const FAR_FAR_AWAY = 9999;
+
+const calculateShift = (activeIndex, currentIndex, numberOfItems) => {
+  if (activeIndex < currentIndex) {
+    // If the new active tab comes before current tab, current tab will shift towards right
+    return 2 * MIN_SHIFT_AMOUNT;
+  }
+
+  if (activeIndex > currentIndex) {
+    // If the new active tab comes after current tab, current tab will shift towards left
+    return -2 * MIN_SHIFT_AMOUNT;
+  }
+
+  if (activeIndex === currentIndex) {
+    if (currentIndex === 0) {
+      // If the current tab is the new active tab and its the first tab, it'll shift towards right
+      return MIN_SHIFT_AMOUNT;
+    }
+
+    if (currentIndex === numberOfItems - 1) {
+      // If the current tab is the new active tab and its the last tab, it'll shift towards left
+      return -MIN_SHIFT_AMOUNT;
+    }
+  }
+
+  // If the current tab is the new active tab and its somewhere in the middle, it won't shift
+  return 0;
+};
 
 /**
  * Bottom navigation provides quick navigation between top-level views of an app with a bottom tab bar.
@@ -272,32 +305,53 @@ class BottomNavigation<T: Route> extends React.Component<Props<T>, State> {
   }
 
   static getDerivedStateFromProps(nextProps, prevState) {
-    const current = nextProps.navigationState.index;
+    const { index, routes } = nextProps.navigationState;
 
-    if (current === prevState.current) {
-      return null;
+    // Re-create animated values if routes have been added/removed
+    // Preserve previous animated values if they exist, so we don't break animations
+    const tabs = routes.map(
+      (_, i) => prevState.tabs[i] || new Animated.Value(i === index ? 1 : 0)
+    );
+    const shifts = routes.map(
+      (_, i) =>
+        prevState.shifts[i] ||
+        new Animated.Value(calculateShift(index, i, routes.length))
+    );
+    const offsets = routes.map(
+      (_, i) => prevState.offsets[i] || new Animated.Value(i === index ? 0 : 1)
+    );
+
+    const nextState = {
+      tabs,
+      shifts,
+      offsets,
+    };
+
+    if (index !== prevState.current) {
+      /* $FlowFixMe */
+      Object.assign(nextState, {
+        // Store the current index in state so that we can later check if the index has changed
+        current: index,
+        previous: prevState.current,
+        // Set the current tab to be loaded if it was not loaded before
+        loaded: prevState.loaded.includes(index)
+          ? prevState.loaded
+          : [...prevState.loaded, index],
+      });
     }
 
-    return {
-      current,
-      previous: prevState.current,
-      loaded: prevState.loaded.includes(current)
-        ? prevState.loaded
-        : [...prevState.loaded, current],
-    };
+    return nextState;
   }
 
   constructor(props) {
     super(props);
 
-    const { routes, index } = this.props.navigationState;
+    const { index } = this.props.navigationState;
 
     this.state = {
-      tabs: routes.map((_, i) => new Animated.Value(i === index ? 1 : 0)),
-      shifts: routes.map(
-        (_, i) =>
-          new Animated.Value(this._calculateShift(index, i, routes.length))
-      ),
+      tabs: [],
+      shifts: [],
+      offsets: [],
       index: new Animated.Value(index),
       ripple: new Animated.Value(MIN_RIPPLE_SCALE),
       touch: new Animated.Value(MIN_RIPPLE_SCALE),
@@ -314,6 +368,13 @@ class BottomNavigation<T: Route> extends React.Component<Props<T>, State> {
     }
 
     const { routes, index } = this.props.navigationState;
+
+    // Reset offsets of previous and current tabs before animation
+    this.state.offsets.forEach((offset, i) => {
+      if (i === index || i === prevProps.navigationState.index) {
+        offset.setValue(0);
+      }
+    });
 
     // Reset the ripple to avoid glitch if it's currently animating
     this.state.ripple.setValue(MIN_RIPPLE_SCALE);
@@ -336,7 +397,7 @@ class BottomNavigation<T: Route> extends React.Component<Props<T>, State> {
           ),
           ...routes.map((_, i) =>
             Animated.timing(this.state.shifts[i], {
-              toValue: this._calculateShift(index, i, routes.length),
+              toValue: calculateShift(index, i, routes.length),
               duration: 200,
               easing: Easing.out(Easing.sin),
               useNativeDriver: true,
@@ -344,42 +405,27 @@ class BottomNavigation<T: Route> extends React.Component<Props<T>, State> {
           ),
         ]),
       ]),
-    ]).start(() => {
+    ]).start(({ finished }) => {
       // Workaround a bug in native animations where this is reset after first animation
       this.state.tabs.map((tab, i) => tab.setValue(i === index ? 1 : 0));
 
       // Update the index to change bar's bacground color and then hide the ripple
       this.state.index.setValue(index);
       this.state.ripple.setValue(MIN_RIPPLE_SCALE);
+
+      if (finished) {
+        // Position all inactive screens offscreen to save memory usage
+        // Only do it when animation has finished to avoid glitches mid-transition if switching fast
+        this.state.offsets.forEach((offset, i) => {
+          if (i === index) {
+            offset.setValue(0);
+          } else {
+            offset.setValue(1);
+          }
+        });
+      }
     });
   }
-
-  _calculateShift = (activeIndex, currentIndex, numberOfItems) => {
-    if (activeIndex < currentIndex) {
-      // If the new active tab comes before current tab, current tab will shift towards right
-      return 2 * MIN_SHIFT_AMOUNT;
-    }
-
-    if (activeIndex > currentIndex) {
-      // If the new active tab comes after current tab, current tab will shift towards left
-      return -2 * MIN_SHIFT_AMOUNT;
-    }
-
-    if (activeIndex === currentIndex) {
-      if (currentIndex === 0) {
-        // If the current tab is the new active tab and its the first tab, it'll shift towards right
-        return MIN_SHIFT_AMOUNT;
-      }
-
-      if (currentIndex === numberOfItems - 1) {
-        // If the current tab is the new active tab and its the last tab, it'll shift towards left
-        return -MIN_SHIFT_AMOUNT;
-      }
-    }
-
-    // If the current tab is the new active tab and its somewhere in the middle, it won't shift
-    return 0;
-  };
 
   _handleLayout = e =>
     this.setState({
@@ -503,6 +549,11 @@ class BottomNavigation<T: Route> extends React.Component<Props<T>, State> {
                 })
               : 0;
 
+            const top = this.state.offsets[index].interpolate({
+              inputRange: [0, 1],
+              outputRange: [0, FAR_FAR_AWAY],
+            });
+
             return (
               <Animated.View
                 key={route.key}
@@ -513,11 +564,19 @@ class BottomNavigation<T: Route> extends React.Component<Props<T>, State> {
                   StyleSheet.absoluteFill,
                   { opacity, transform: [{ translateY }] },
                 ]}
+                collapsable={false}
+                removeClippedSubviews={
+                  // On iOS, set removeClippedSubviews to true only when not focused
+                  // This is an workaround for a bug where the clipped view never re-appears
+                  Platform.OS === 'ios' ? navigationState.index !== index : true
+                }
               >
-                {renderScene({
-                  route,
-                  jumpTo: this._jumpTo,
-                })}
+                <Animated.View style={[styles.content, { top }]}>
+                  {renderScene({
+                    route,
+                    jumpTo: this._jumpTo,
+                  })}
+                </Animated.View>
               </Animated.View>
             );
           })}
